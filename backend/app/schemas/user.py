@@ -1,10 +1,12 @@
 # STEP 11: User profile schema + endpoint
 # File: app/schemas/user.py
 
-from pydantic import BaseModel
+from pydantic import BaseModel,ConfigDict
 from datetime import datetime
 
 class UserProfile(BaseModel):
+    model_config = ConfigDict(from_attributes=True)  # Updated for Pydantic V2
+
     id: int
     username: str
     email: str
@@ -17,8 +19,6 @@ class UserProfile(BaseModel):
     last_login: datetime | None
     created_at: datetime
 
-    class Config:
-        orm_mode = True
 
 
 # STEP 14: Create user creation and list schemas
@@ -37,6 +37,8 @@ class CreateUserRequest(BaseModel):
     must_change_password: bool = True
 
 class UserListResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)  # Updated for Pydantic V2
+
     id: int
     username: str
     email: str
@@ -48,8 +50,6 @@ class UserListResponse(BaseModel):
     is_active: bool
     last_login: datetime | None
 
-    class Config:
-        orm_mode = True
 
 class UpdateUserProfile(BaseModel):
     first_name: str

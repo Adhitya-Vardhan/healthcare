@@ -4,6 +4,7 @@ from app.db.session import SessionLocal
 from app.models.models import User, Role, Location, Team, Patient, FileUpload, UserAuditLog, EncryptionKey
 from app.utils.security import hash_password
 from hashlib import sha256
+from datetime import datetime
 
 db = SessionLocal()
 
@@ -60,6 +61,7 @@ ar_team = db.query(Team).filter(Team.code == "AR").first()
 epa_team = db.query(Team).filter(Team.code == "EPA").first()
 
 print("✅ Seeding users...")
+# File: backend/seed_data.py
 admin_user = User(
     username="admin",
     email="admin@example.com",
@@ -72,7 +74,9 @@ admin_user = User(
     location_id=us_location.id,
     team_id=ar_team.id,
     is_active=True,
-    is_verified=True
+    is_verified=True,
+    must_change_password=False,
+    created_at=datetime.utcnow()
 )
 
 manager_user = User(

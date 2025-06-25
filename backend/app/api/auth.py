@@ -6,7 +6,14 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.schemas.auth import LoginRequest, TokenResponse
 from app.services.auth_service import login
-
+# In your auth.py file
+from app.core.security import (
+    create_access_token, 
+    create_refresh_token, 
+    verify_password, 
+    hash_password,
+    validate_password_strength
+)
 from slowapi import Limiter
 from app.core.rate_limitter import limiter
 

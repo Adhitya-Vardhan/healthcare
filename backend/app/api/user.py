@@ -8,6 +8,7 @@ from app.schemas.user import UpdateUserProfile
 
 router = APIRouter()
 
+
 @router.get("/users/profile", response_model=UserProfile)
 def get_profile(current_user = Depends(get_current_user)):
     return {
@@ -21,10 +22,9 @@ def get_profile(current_user = Depends(get_current_user)):
         "location": current_user.location.code,
         "team": current_user.team.code,
         "last_login": current_user.last_login,
-        "created_at": current_user.created_at
+        # Use getattr with default value to handle missing created_at
+        "created_at": getattr(current_user, 'created_at', None)
     }
-
-
 
 @router.put("/users/profile", response_model=UserProfile)
 def update_profile(data: UpdateUserProfile, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
@@ -45,6 +45,6 @@ def update_profile(data: UpdateUserProfile, db: Session = Depends(get_db), curre
         "location": current_user.location.code,
         "team": current_user.team.code,
         "last_login": current_user.last_login,
-        "created_at": current_user.created_at
+        # Use getattr with default value to handle missing created_at
+        "created_at": getattr(current_user, 'created_at', None)
     }
-

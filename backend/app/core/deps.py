@@ -1,18 +1,18 @@
-# STEP 10: Add JWT authentication dependency
-# File: app/core/deps.py
+# Fixed dependencies file with proper middleware
+# File: backend/app/core/deps.py
 
-from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
+from fastapi import Depends, HTTPException, status, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 from app.db.session import SessionLocal
 from app.models.models import User
-import os
+from app.core.security import verify_token
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
-
-SECRET_KEY = os.getenv("SECRET_KEY")
-ALGORITHM = os.getenv("ALGORITHM")
+# Security scheme
+security = HTTPBearer()
 
 def get_db():
     db = SessionLocal()
@@ -21,20 +21,53 @@ def get_db():
     finally:
         db.close()
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials"
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-
-    user = db.query(User).filter(User.username == username).first()
-    if not user or not user.is_active:
-        raise credentials_exception
+def get_current_user(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> User:
+    """Get current authenticated user and set user_id in request state"""
+    
+    # Verify the token
+    token_data = verify_token(credentials.credentials)
+    if not token_data:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Get user from database
+    user = db.query(User).filter(User.id == token_data.get("user_id")).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Set user_id in request state for rate limiting
+    request.state.user_id = user.id
+    request.state.user = user
+    
     return user
+
+class UserContextMiddleware(BaseHTTPMiddleware):
+    """Middleware to extract and store user context in request state"""
+    
+    async def dispatch(self, request: Request, call_next):
+        # Try to extract user info from Authorization header
+        try:
+            auth_header = request.headers.get("Authorization")
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header.split(" ")[1]
+                from app.core.security import get_token_data
+                token_data = get_token_data(token)
+                if token_data and "user_id" in token_data:
+                    request.state.user_id = token_data["user_id"]
+        except Exception:
+            # If token extraction fails, continue without setting user_id
+            pass
+        
+        response = await call_next(request)
+        return response

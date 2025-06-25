@@ -26,6 +26,7 @@ class Location(Base):
     code = Column(String(10), unique=True, nullable=False)
     name = Column(String(100), nullable=False)
     country = Column(String(50), nullable=False)
+    is_active = Column(Boolean, default=True)
 
 class Team(Base):
     __tablename__ = "teams"
@@ -33,6 +34,7 @@ class Team(Base):
     code = Column(String(10), unique=True, nullable=False)
     name = Column(String(100), nullable=False)
     description = Column(Text)
+    is_active = Column(Boolean, default=True)
 
 class User(Base):
     __tablename__ = "users"
@@ -51,11 +53,15 @@ class User(Base):
 
     is_active = Column(Boolean, default=True)
     is_verified = Column(Boolean, default=False)
+    
+    # Add missing fields
+    must_change_password = Column(Boolean, default=False)
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+    last_login = Column(TIMESTAMP, nullable=True)
 
     role = relationship("Role")
     location = relationship("Location")
     team = relationship("Team")
-    last_login = Column(TIMESTAMP, nullable=True)
 
 class Patient(Base):
     __tablename__ = "patients"
