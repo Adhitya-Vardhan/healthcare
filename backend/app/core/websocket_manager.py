@@ -39,43 +39,54 @@ class ConnectionManager:
     
     async def connect(self, websocket: WebSocket, user_id: int, user_role: str, connection_id: str = None):
         """Accept WebSocket connection and store user info"""
-        await websocket.accept()
-        
-        # Generate connection ID if not provided
-        if not connection_id:
-            connection_id = str(uuid.uuid4())
-        
-        # Store connection
-        if user_id not in self.active_connections:
-            self.active_connections[user_id] = []
-        
-        self.active_connections[user_id].append(websocket)
-        self.connection_ids[connection_id] = websocket
-        
-        # Store metadata
-        self.connection_metadata[websocket] = {
-            "user_id": user_id,
-            "user_role": user_role,
-            "connection_id": connection_id,
-            "connected_at": datetime.utcnow(),
-            "last_ping": datetime.utcnow()
-        }
-        
-        # Add to appropriate rooms based on role
-        await self.join_room(websocket, f"user_{user_id}")
-        await self.join_room(websocket, f"role_{user_role.lower()}")
-        
-        # Send connection acknowledgment
-        await self.send_personal_message({
-            "type": MessageType.CONNECTION_ACK,
-            "data": {
+        try:
+            # Note: websocket.accept() is called in the endpoint before this method
+            # so we don't need to call it again here
+            
+            # Generate connection ID if not provided
+            if not connection_id:
+                connection_id = str(uuid.uuid4())
+            
+            # Store connection
+            if user_id not in self.active_connections:
+                self.active_connections[user_id] = []
+            
+            self.active_connections[user_id].append(websocket)
+            self.connection_ids[connection_id] = websocket
+            
+            # Store metadata
+            self.connection_metadata[websocket] = {
+                "user_id": user_id,
+                "user_role": user_role,
                 "connection_id": connection_id,
-                "message": "Connected successfully",
-                "timestamp": datetime.utcnow().isoformat()
+                "connected_at": datetime.utcnow(),
+                "last_ping": datetime.utcnow()
             }
-        }, websocket)
-        
-        print(f"🔗 WebSocket connected: User {user_id} ({user_role}) - Connection {connection_id}")
+            
+            # Add to appropriate rooms based on role
+            await self.join_room(websocket, f"user_{user_id}")
+            await self.join_room(websocket, f"role_{user_role.lower()}")
+            
+            # Send connection acknowledgment
+            await self.send_personal_message({
+                "type": MessageType.CONNECTION_ACK,
+                "data": {
+                    "connection_id": connection_id,
+                    "message": "Connected successfully",
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+            }, websocket)
+            
+            print(f"🔗 WebSocket connected: User {user_id} ({user_role}) - Connection {connection_id}")
+            
+        except Exception as e:
+            print(f"❌ Error during WebSocket connection: {e}")
+            # Try to close the connection if it was partially established
+            try:
+                await websocket.close(code=1011, reason="Internal server error")
+            except:
+                pass
+            raise
     
     async def disconnect(self, websocket: WebSocket):
         """Remove WebSocket connection"""
@@ -119,7 +130,11 @@ class ConnectionManager:
     async def send_personal_message(self, message: dict, websocket: WebSocket):
         """Send message to specific WebSocket connection"""
         try:
-            await websocket.send_text(json.dumps(message, default=str))
+            if websocket.client_state.value == 1:  # Check if connection is still open
+                await websocket.send_text(json.dumps(message, default=str))
+            else:
+                print(f"⚠️ WebSocket connection is closed, removing from manager")
+                await self.disconnect(websocket)
         except Exception as e:
             print(f"❌ Error sending message to WebSocket: {e}")
             await self.disconnect(websocket)
@@ -130,7 +145,10 @@ class ConnectionManager:
             disconnected_connections = []
             for connection in self.active_connections[user_id]:
                 try:
-                    await connection.send_text(json.dumps(message, default=str))
+                    if connection.client_state.value == 1:  # Check if connection is still open
+                        await connection.send_text(json.dumps(message, default=str))
+                    else:
+                        disconnected_connections.append(connection)
                 except Exception as e:
                     print(f"❌ Error sending to user {user_id}: {e}")
                     disconnected_connections.append(connection)
@@ -145,7 +163,10 @@ class ConnectionManager:
             disconnected_connections = []
             for connection in self.rooms[room_name].copy():
                 try:
-                    await connection.send_text(json.dumps(message, default=str))
+                    if connection.client_state.value == 1:  # Check if connection is still open
+                        await connection.send_text(json.dumps(message, default=str))
+                    else:
+                        disconnected_connections.append(connection)
                 except Exception as e:
                     print(f"❌ Error sending to room {room_name}: {e}")
                     disconnected_connections.append(connection)
@@ -167,7 +188,10 @@ class ConnectionManager:
         disconnected_connections = []
         for connection in all_connections:
             try:
-                await connection.send_text(json.dumps(message, default=str))
+                if connection.client_state.value == 1:  # Check if connection is still open
+                    await connection.send_text(json.dumps(message, default=str))
+                else:
+                    disconnected_connections.append(connection)
             except Exception as e:
                 print(f"❌ Error broadcasting: {e}")
                 disconnected_connections.append(connection)

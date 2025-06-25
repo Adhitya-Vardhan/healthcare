@@ -4,6 +4,7 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from app.core.deps import get_db
+from app.db.session import SessionLocal
 from app.core.websocket_manager import connection_manager, websocket_notifier, MessageType
 from app.core.security import verify_token
 from app.models.models import User, UserAuditLog, EncryptionAuditLog, Patient
@@ -13,10 +14,11 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Optional
 import psutil
+from contextlib import asynccontextmanager
 
 router = APIRouter()
 
-async def get_user_from_token(token: str, db: Session) -> Optional[User]:
+async def get_user_from_token(token: str, db: Session) -> Optional[dict]:
     """Get user from JWT token for WebSocket authentication"""
     try:
         token_data = verify_token(token)
@@ -24,9 +26,28 @@ async def get_user_from_token(token: str, db: Session) -> Optional[User]:
             return None
         
         user = db.query(User).filter(User.id == token_data.get("user_id")).first()
-        return user
-    except Exception:
+        if user:
+            # Load the role relationship and return user data as dict
+            return {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "role_name": user.role.name,  # Load role within this session
+                "is_active": user.is_active
+            }
         return None
+    except Exception as e:
+        print(f"❌ Error getting user from token: {e}")
+        return None
+
+@asynccontextmanager
+async def get_db_session():
+    """Async context manager for database sessions"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 @router.websocket("/ws")
 async def websocket_endpoint(
@@ -35,25 +56,29 @@ async def websocket_endpoint(
     connection_id: Optional[str] = Query(None, description="Optional connection identifier")
 ):
     """Main WebSocket endpoint for real-time communication"""
-    db = next(get_db())
-    user = None
+    user_data = None
     
     try:
-        # Authenticate user
-        user = await get_user_from_token(token, db)
-        if not user:
-            await websocket.close(code=4001, reason="Invalid authentication token")
-            return
+        # Accept the WebSocket connection first
+        await websocket.accept()
         
-        # Connect user
-        await connection_manager.connect(websocket, user.id, user.role.name, connection_id)
+        # Authenticate user with a fresh database session
+        async with get_db_session() as db:
+            user_data = await get_user_from_token(token, db)
+            if not user_data:
+                await websocket.close(code=4001, reason="Invalid authentication token")
+                return
         
-        # Log connection
-        await websocket_notifier.notify_audit_event(
-            "websocket_connect",
-            user.id,
-            {"connection_id": connection_id, "user_role": user.role.name}
-        )
+        # Connect user to the manager
+        await connection_manager.connect(websocket, user_data["id"], user_data["role_name"], connection_id)
+        
+        # Log connection with a fresh database session
+        async with get_db_session() as db:
+            await websocket_notifier.notify_audit_event(
+                "websocket_connect",
+                user_data["id"],
+                {"connection_id": connection_id, "user_role": user_data["role_name"]}
+            )
         
         # Keep connection alive and handle messages
         while True:
@@ -62,8 +87,9 @@ async def websocket_endpoint(
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
                 message = json.loads(data)
                 
-                # Handle different message types
-                await handle_websocket_message(websocket, user, message, db)
+                # Handle different message types with a fresh database session
+                async with get_db_session() as db:
+                    await handle_websocket_message(websocket, user_data, message, db)
                 
             except asyncio.TimeoutError:
                 # Send heartbeat on timeout
@@ -74,19 +100,19 @@ async def websocket_endpoint(
                 
     except WebSocketDisconnect:
         await connection_manager.disconnect(websocket)
-        if user:
-            await websocket_notifier.notify_audit_event(
-                "websocket_disconnect",
-                user.id,
-                {"connection_id": connection_id}
-            )
+        if user_data:
+            async with get_db_session() as db:
+                await websocket_notifier.notify_audit_event(
+                    "websocket_disconnect",
+                    user_data["id"],
+                    {"connection_id": connection_id}
+                )
     except Exception as e:
         print(f"❌ WebSocket error: {e}")
         await connection_manager.disconnect(websocket)
-    finally:
-        db.close()
+        # Don't close the database session here as it's managed by the context manager
 
-async def handle_websocket_message(websocket: WebSocket, user: User, message: dict, db: Session):
+async def handle_websocket_message(websocket: WebSocket, user_data: dict, message: dict, db: Session):
     """Handle incoming WebSocket messages"""
     message_type = message.get("type")
     data = message.get("data", {})
@@ -101,7 +127,7 @@ async def handle_websocket_message(websocket: WebSocket, user: User, message: di
             
         elif message_type == "subscribe_audit":
             # Subscribe to audit logs (Admin only)
-            if user.role.name == "Admin":
+            if user_data["role_name"] == "Admin":
                 await connection_manager.join_room(websocket, "audit_subscribers")
                 await connection_manager.send_personal_message({
                     "type": "subscription_ack",
@@ -115,7 +141,7 @@ async def handle_websocket_message(websocket: WebSocket, user: User, message: di
                 
         elif message_type == "subscribe_health":
             # Subscribe to system health updates (Admin only)
-            if user.role.name == "Admin":
+            if user_data["role_name"] == "Admin":
                 await connection_manager.join_room(websocket, "health_subscribers")
                 await connection_manager.send_personal_message({
                     "type": "subscription_ack",
@@ -131,8 +157,8 @@ async def handle_websocket_message(websocket: WebSocket, user: User, message: di
                 
         elif message_type == "get_patient_count":
             # Get real-time patient count for user
-            if user.role.name == "Manager":
-                count = db.query(Patient).filter(Patient.uploaded_by == user.id).count()
+            if user_data["role_name"] == "Manager":
+                count = db.query(Patient).filter(Patient.uploaded_by == user_data["id"]).count()
                 await connection_manager.send_personal_message({
                     "type": "patient_count",
                     "data": {"count": count, "timestamp": datetime.utcnow().isoformat()}
@@ -140,7 +166,7 @@ async def handle_websocket_message(websocket: WebSocket, user: User, message: di
                 
         elif message_type == "get_connection_stats":
             # Get connection statistics (Admin only)
-            if user.role.name == "Admin":
+            if user_data["role_name"] == "Admin":
                 stats = connection_manager.get_connection_stats()
                 await connection_manager.send_personal_message({
                     "type": "connection_stats",
@@ -201,6 +227,10 @@ async def send_current_health_status(websocket: WebSocket, db: Session):
         
     except Exception as e:
         print(f"❌ Error sending health status: {e}")
+        await connection_manager.send_personal_message({
+            "type": "error",
+            "data": {"message": f"Error getting health status: {str(e)}"}
+        }, websocket)
 
 @router.websocket("/ws/admin")
 async def admin_websocket_endpoint(
@@ -208,44 +238,50 @@ async def admin_websocket_endpoint(
     token: str = Query(..., description="JWT authentication token")
 ):
     """Dedicated WebSocket endpoint for admin real-time monitoring"""
-    db = next(get_db())
-    user = None
+    user_data = None
     
     try:
-        # Authenticate admin user
-        user = await get_user_from_token(token, db)
-        if not user or user.role.name != "Admin":
-            await websocket.close(code=4003, reason="Admin access required")
-            return
+        # Accept the WebSocket connection first
+        await websocket.accept()
+        
+        # Authenticate admin user with a fresh database session
+        async with get_db_session() as db:
+            user_data = await get_user_from_token(token, db)
+            if not user_data or user_data["role_name"] != "Admin":
+                await websocket.close(code=4003, reason="Admin access required")
+                return
         
         # Connect admin
-        await connection_manager.connect(websocket, user.id, user.role.name)
+        await connection_manager.connect(websocket, user_data["id"], user_data["role_name"])
         
         # Auto-subscribe to admin feeds
         await connection_manager.join_room(websocket, "audit_subscribers")
         await connection_manager.join_room(websocket, "health_subscribers")
         
-        # Send initial data
-        await send_admin_dashboard_data(websocket, db)
+        # Send initial data with a fresh database session
+        async with get_db_session() as db:
+            await send_admin_dashboard_data(websocket, db)
         
         # Keep connection alive
         while True:
             try:
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
                 message = json.loads(data)
-                await handle_admin_message(websocket, user, message, db)
+                
+                # Handle admin messages with a fresh database session
+                async with get_db_session() as db:
+                    await handle_admin_message(websocket, user_data, message, db)
                 
             except asyncio.TimeoutError:
-                # Send periodic updates
-                await send_admin_dashboard_data(websocket, db)
+                # Send periodic updates with a fresh database session
+                async with get_db_session() as db:
+                    await send_admin_dashboard_data(websocket, db)
                 
     except WebSocketDisconnect:
         await connection_manager.disconnect(websocket)
     except Exception as e:
         print(f"❌ Admin WebSocket error: {e}")
         await connection_manager.disconnect(websocket)
-    finally:
-        db.close()
 
 async def send_admin_dashboard_data(websocket: WebSocket, db: Session):
     """Send comprehensive admin dashboard data"""
@@ -323,7 +359,7 @@ async def send_admin_dashboard_data(websocket: WebSocket, db: Session):
     except Exception as e:
         print(f"❌ Error sending admin dashboard data: {e}")
 
-async def handle_admin_message(websocket: WebSocket, user: User, message: dict, db: Session):
+async def handle_admin_message(websocket: WebSocket, user_data: dict, message: dict, db: Session):
     """Handle admin-specific WebSocket messages"""
     message_type = message.get("type")
     
@@ -362,12 +398,9 @@ async def periodic_admin_updates():
             
             # Send to health subscribers
             if "health_subscribers" in connection_manager.rooms:
-                db = next(get_db())
-                try:
+                async with get_db_session() as db:
                     for websocket in connection_manager.rooms["health_subscribers"]:
                         await send_current_health_status(websocket, db)
-                finally:
-                    db.close()
                     
         except Exception as e:
             print(f"❌ Error in periodic admin updates: {e}")
