@@ -1,0 +1,42 @@
+# File: .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+venv/
+.env
+.env.*
+
+# Pytest
+.cache/
+.pytest_cache/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Uvicorn reload artifacts
+.watchfiles*
+
+# Migrations (optional if not using Alembic migrations in repo)
+alembic/versions/
+
+# SQLite files (if used for dev)
+*.db
+
+# Logs
+*.log
