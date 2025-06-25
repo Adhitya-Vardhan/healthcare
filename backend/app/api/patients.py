@@ -1,5 +1,5 @@
-# Complete patients.py with all CRUD operations
-# File: backend/app/api/patients.py
+# Enhanced patients.py with WebSocket real-time notifications
+# File: app/api/patients.py
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Request, Query
 from sqlalchemy.orm import Session
@@ -14,7 +14,8 @@ from app.schemas.patient import (
     PatientSearchRequest,
     PatientUploadResponse
 )
-from app.utils.encryption import encrypt_field, decrypt_field
+from app.utils.encryption import encryption_service
+from app.core.websocket_manager import websocket_notifier  # Import WebSocket notifier
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 import pandas as pd
@@ -23,6 +24,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 import hashlib
+import asyncio
 
 router = APIRouter()
 
@@ -83,17 +85,17 @@ def create_data_hash(patient_id: str, first_name: str, last_name: str, date_of_b
     data_string = f"{patient_id}|{first_name}|{last_name}|{date_of_birth}|{gender}"
     return hashlib.sha256(data_string.encode()).hexdigest()
 
-# ===== UPLOAD ENDPOINTS =====
+# ===== UPLOAD ENDPOINTS WITH REAL-TIME PROGRESS =====
 
 @router.post("/upload", response_model=PatientUploadResponse)
 @limiter.limit("10/hour")
-async def upload_patients(
+async def upload_patients_with_progress(
     request: Request,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_manager_role)
 ):
-    """Upload patients from CSV or XLSX file"""
+    """Upload patients with real-time WebSocket progress updates"""
     try:
         # Validate file type
         allowed_extensions = ['.csv', '.xlsx', '.xls']
@@ -112,14 +114,38 @@ async def upload_patients(
         # Generate batch ID
         batch_id = str(uuid.uuid4())
         
+        # Notify upload started
+        await websocket_notifier.notify_upload_progress(
+            current_user.id, 
+            batch_id, 
+            0, 
+            "Upload started - Reading file..."
+        )
+        
         # Read the file
         contents = await file.read()
         file_size = len(contents)
+        
+        # Notify file read complete
+        await websocket_notifier.notify_upload_progress(
+            current_user.id, 
+            batch_id, 
+            10, 
+            "File read complete - Parsing data..."
+        )
         
         if file_extension == '.csv':
             df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
         else:
             df = pd.read_excel(io.BytesIO(contents))
+        
+        # Notify parsing complete
+        await websocket_notifier.notify_upload_progress(
+            current_user.id, 
+            batch_id, 
+            20, 
+            "Data parsing complete - Validating structure..."
+        )
         
         # Normalize column names
         df = normalize_column_names(df)
@@ -127,6 +153,11 @@ async def upload_patients(
         # Validate required columns
         missing_columns = validate_required_columns(df)
         if missing_columns:
+            await websocket_notifier.notify_upload_error(
+                current_user.id,
+                batch_id,
+                f"Missing required columns: {missing_columns}"
+            )
             raise HTTPException(
                 status_code=400, 
                 detail=f"Missing required columns: {missing_columns}. Required: Patient ID, First Name, Last Name, Date of Birth, Gender"
@@ -134,6 +165,14 @@ async def upload_patients(
         
         # Clean data
         df = df.dropna(subset=['patient_id'])
+        
+        # Notify validation complete
+        await websocket_notifier.notify_upload_progress(
+            current_user.id, 
+            batch_id, 
+            30, 
+            f"Validation complete - Processing {len(df)} records..."
+        )
         
         # Create file upload record
         file_upload = FileUpload(
@@ -150,13 +189,26 @@ async def upload_patients(
         db.add(file_upload)
         db.commit()
         
-        # Process patients
+        # Process patients with progress updates
         successful_count = 0
         failed_count = 0
         errors = []
+        total_records = len(df)
         
         for index, row in df.iterrows():
             try:
+                # Calculate progress (30% start + 60% for processing + 10% for completion)
+                progress = 30 + int((index / total_records) * 60)
+                
+                # Send progress update every 10 records or on last record
+                if index % 10 == 0 or index == total_records - 1:
+                    await websocket_notifier.notify_upload_progress(
+                        current_user.id,
+                        batch_id,
+                        progress,
+                        f"Processing record {index + 1} of {total_records}..."
+                    )
+                
                 # Validate row data
                 patient_id = str(row['patient_id']).strip()
                 first_name = str(row['first_name']).strip()
@@ -176,11 +228,19 @@ async def upload_patients(
                     failed_count += 1
                     continue
                 
-                # Encrypt patient data
-                encrypted_first_name = encrypt_field(first_name)
-                encrypted_last_name = encrypt_field(last_name)
-                encrypted_date_of_birth = encrypt_field(date_of_birth)
-                encrypted_gender = encrypt_field(gender)
+                # Encrypt patient data with audit logging
+                encrypted_first_name = encryption_service.encrypt_field(
+                    first_name, "first_name", db, patient_id, current_user.id
+                )
+                encrypted_last_name = encryption_service.encrypt_field(
+                    last_name, "last_name", db, patient_id, current_user.id
+                )
+                encrypted_date_of_birth = encryption_service.encrypt_field(
+                    date_of_birth, "date_of_birth", db, patient_id, current_user.id
+                )
+                encrypted_gender = encryption_service.encrypt_field(
+                    gender, "gender", db, patient_id, current_user.id
+                )
                 
                 # Create data hash
                 data_hash = create_data_hash(patient_id, first_name, last_name, date_of_birth, gender)
@@ -201,10 +261,25 @@ async def upload_patients(
                 db.add(patient)
                 successful_count += 1
                 
+                # Send notification for successful patient creation
+                await websocket_notifier.notify_patient_created(
+                    current_user.id,
+                    patient_id,
+                    f"{first_name} {last_name}"
+                )
+                
             except Exception as e:
                 errors.append(f"Row {index + 1}: {str(e)}")
                 failed_count += 1
                 continue
+        
+        # Notify processing complete
+        await websocket_notifier.notify_upload_progress(
+            current_user.id, 
+            batch_id, 
+            90, 
+            "Processing complete - Finalizing upload..."
+        )
         
         # Update file upload record
         file_upload.successful_records = successful_count
@@ -214,6 +289,28 @@ async def upload_patients(
         
         db.commit()
         
+        # Send final completion notification
+        await websocket_notifier.notify_upload_complete(
+            current_user.id,
+            batch_id,
+            total_records,
+            successful_count,
+            failed_count
+        )
+        
+        # Notify audit event for admins
+        await websocket_notifier.notify_audit_event(
+            "patient_upload_completed",
+            current_user.id,
+            {
+                "batch_id": batch_id,
+                "total_records": total_records,
+                "successful": successful_count,
+                "failed": failed_count,
+                "filename": file.filename
+            }
+        )
+        
         return PatientUploadResponse(
             batch_id=batch_id,
             filename=file.filename,
@@ -222,11 +319,27 @@ async def upload_patients(
             uploaded_at=file_upload.processing_started_at
         )
         
+    except HTTPException:
+        # Send error notification for HTTP exceptions
+        if 'batch_id' in locals():
+            await websocket_notifier.notify_upload_error(
+                current_user.id,
+                batch_id,
+                "Upload failed due to validation error"
+            )
+        raise
     except Exception as e:
         db.rollback()
+        # Send error notification
+        if 'batch_id' in locals():
+            await websocket_notifier.notify_upload_error(
+                current_user.id,
+                batch_id,
+                f"Upload failed: {str(e)}"
+            )
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
-# ===== PATIENT CRUD ENDPOINTS =====
+# ===== PATIENT CRUD ENDPOINTS WITH NOTIFICATIONS =====
 
 @router.get("", response_model=PatientListResponse)
 async def get_patients(
@@ -248,13 +361,27 @@ async def get_patients(
         patient_rows = []
         for patient in patients:
             try:
+                # Decrypt with audit logging
+                first_name = encryption_service.decrypt_field(
+                    patient.first_name_encrypted, "first_name", db, patient.patient_id, current_user.id
+                )
+                last_name = encryption_service.decrypt_field(
+                    patient.last_name_encrypted, "last_name", db, patient.patient_id, current_user.id
+                )
+                date_of_birth = encryption_service.decrypt_field(
+                    patient.date_of_birth_encrypted, "date_of_birth", db, patient.patient_id, current_user.id
+                )
+                gender = encryption_service.decrypt_field(
+                    patient.gender_encrypted, "gender", db, patient.patient_id, current_user.id
+                )
+                
                 patient_row = PatientRow(
                     id=patient.id,
                     patient_id=patient.patient_id,
-                    first_name=decrypt_field(patient.first_name_encrypted),
-                    last_name=decrypt_field(patient.last_name_encrypted),
-                    date_of_birth=decrypt_field(patient.date_of_birth_encrypted),
-                    gender=decrypt_field(patient.gender_encrypted),
+                    first_name=first_name,
+                    last_name=last_name,
+                    date_of_birth=date_of_birth,
+                    gender=gender,
                     uploaded_by=current_user.username,
                     uploaded_at=patient.created_at,
                     updated_at=patient.updated_at
@@ -276,6 +403,146 @@ async def get_patients(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching patients: {str(e)}")
+
+@router.put("/{patient_id}", response_model=PatientDetail)
+async def update_patient_with_notification(
+    patient_id: int,
+    update_data: UpdatePatientRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_manager_role)
+):
+    """Update patient information with real-time notifications"""
+    try:
+        # Find patient
+        patient = db.query(Patient).filter(
+            and_(Patient.id == patient_id, Patient.uploaded_by == current_user.id)
+        ).first()
+        
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found")
+        
+        # Update encrypted fields with audit logging
+        patient.first_name_encrypted = encryption_service.encrypt_field(
+            update_data.first_name, "first_name", db, patient.patient_id, current_user.id
+        )
+        patient.last_name_encrypted = encryption_service.encrypt_field(
+            update_data.last_name, "last_name", db, patient.patient_id, current_user.id
+        )
+        patient.date_of_birth_encrypted = encryption_service.encrypt_field(
+            update_data.date_of_birth, "date_of_birth", db, patient.patient_id, current_user.id
+        )
+        patient.gender_encrypted = encryption_service.encrypt_field(
+            update_data.gender, "gender", db, patient.patient_id, current_user.id
+        )
+        
+        # Update data hash
+        patient.data_hash = create_data_hash(
+            patient.patient_id,
+            update_data.first_name,
+            update_data.last_name,
+            update_data.date_of_birth,
+            update_data.gender
+        )
+        
+        patient.updated_at = datetime.utcnow()
+        
+        db.commit()
+        db.refresh(patient)
+        
+        # Send real-time notification
+        await websocket_notifier.notify_patient_updated(
+            current_user.id,
+            patient.patient_id,
+            f"{update_data.first_name} {update_data.last_name}"
+        )
+        
+        # Notify audit event for admins
+        await websocket_notifier.notify_audit_event(
+            "patient_updated",
+            current_user.id,
+            {
+                "patient_id": patient.patient_id,
+                "patient_name": f"{update_data.first_name} {update_data.last_name}"
+            }
+        )
+        
+        return PatientDetail(
+            id=patient.id,
+            patient_id=patient.patient_id,
+            first_name=update_data.first_name,
+            last_name=update_data.last_name,
+            date_of_birth=update_data.date_of_birth,
+            gender=update_data.gender,
+            uploaded_by=current_user.username,
+            uploaded_at=patient.created_at,
+            updated_at=patient.updated_at,
+            batch_id=patient.file_upload_batch_id or "N/A"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Update failed: {str(e)}")
+
+@router.delete("/{patient_id}")
+async def delete_patient_with_notification(
+    patient_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_manager_role)
+):
+    """Delete a patient with real-time notifications"""
+    try:
+        # Find patient
+        patient = db.query(Patient).filter(
+            and_(Patient.id == patient_id, Patient.uploaded_by == current_user.id)
+        ).first()
+        
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found")
+        
+        # Get patient name for notification (decrypt first)
+        try:
+            first_name = encryption_service.decrypt_field(
+                patient.first_name_encrypted, "first_name", db, patient.patient_id, current_user.id
+            )
+            last_name = encryption_service.decrypt_field(
+                patient.last_name_encrypted, "last_name", db, patient.patient_id, current_user.id
+            )
+            patient_name = f"{first_name} {last_name}"
+        except:
+            patient_name = patient.patient_id
+        
+        # Delete patient
+        db.delete(patient)
+        db.commit()
+        
+        # Send real-time notification
+        await websocket_notifier.notify_patient_deleted(
+            current_user.id,
+            patient.patient_id,
+            patient_name
+        )
+        
+        # Notify audit event for admins
+        await websocket_notifier.notify_audit_event(
+            "patient_deleted",
+            current_user.id,
+            {
+                "patient_id": patient.patient_id,
+                "patient_name": patient_name
+            }
+        )
+        
+        return {"message": "Patient deleted successfully", "patient_id": patient_id}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Deletion failed: {str(e)}")
+
+# ===== SEARCH AND OTHER ENDPOINTS (same as before) =====
 
 @router.post("/search", response_model=PatientListResponse)
 async def search_patients(
@@ -299,10 +566,10 @@ async def search_patients(
                 # Decrypt data for searching
                 decrypted_data = {
                     'patient_id': patient.patient_id,
-                    'first_name': decrypt_field(patient.first_name_encrypted).lower(),
-                    'last_name': decrypt_field(patient.last_name_encrypted).lower(),
-                    'date_of_birth': decrypt_field(patient.date_of_birth_encrypted),
-                    'gender': decrypt_field(patient.gender_encrypted).lower()
+                    'first_name': encryption_service.decrypt_field(patient.first_name_encrypted, "first_name").lower(),
+                    'last_name': encryption_service.decrypt_field(patient.last_name_encrypted, "last_name").lower(),
+                    'date_of_birth': encryption_service.decrypt_field(patient.date_of_birth_encrypted, "date_of_birth"),
+                    'gender': encryption_service.decrypt_field(patient.gender_encrypted, "gender").lower()
                 }
                 
                 # Apply search filters
@@ -384,24 +651,30 @@ async def get_patient(
         if not patient:
             raise HTTPException(status_code=404, detail="Patient not found")
         
-        # Decrypt patient data
+        # Decrypt patient data with audit logging
         try:
-            decrypted_data = {
-                'first_name': decrypt_field(patient.first_name_encrypted),
-                'last_name': decrypt_field(patient.last_name_encrypted),
-                'date_of_birth': decrypt_field(patient.date_of_birth_encrypted),
-                'gender': decrypt_field(patient.gender_encrypted)
-            }
+            first_name = encryption_service.decrypt_field(
+                patient.first_name_encrypted, "first_name", db, patient.patient_id, current_user.id
+            )
+            last_name = encryption_service.decrypt_field(
+                patient.last_name_encrypted, "last_name", db, patient.patient_id, current_user.id
+            )
+            date_of_birth = encryption_service.decrypt_field(
+                patient.date_of_birth_encrypted, "date_of_birth", db, patient.patient_id, current_user.id
+            )
+            gender = encryption_service.decrypt_field(
+                patient.gender_encrypted, "gender", db, patient.patient_id, current_user.id
+            )
         except Exception as e:
             raise HTTPException(status_code=500, detail="Unable to decrypt patient data")
         
         return PatientDetail(
             id=patient.id,
             patient_id=patient.patient_id,
-            first_name=decrypted_data['first_name'],
-            last_name=decrypted_data['last_name'],
-            date_of_birth=decrypted_data['date_of_birth'],
-            gender=decrypted_data['gender'],
+            first_name=first_name,
+            last_name=last_name,
+            date_of_birth=date_of_birth,
+            gender=gender,
             uploaded_by=current_user.username,
             uploaded_at=patient.created_at,
             updated_at=patient.updated_at,
@@ -412,92 +685,6 @@ async def get_patient(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching patient: {str(e)}")
-
-@router.put("/{patient_id}", response_model=PatientDetail)
-async def update_patient(
-    patient_id: int,
-    update_data: UpdatePatientRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_manager_role)
-):
-    """Update patient information"""
-    try:
-        # Find patient
-        patient = db.query(Patient).filter(
-            and_(Patient.id == patient_id, Patient.uploaded_by == current_user.id)
-        ).first()
-        
-        if not patient:
-            raise HTTPException(status_code=404, detail="Patient not found")
-        
-        # Update encrypted fields
-        patient.first_name_encrypted = encrypt_field(update_data.first_name)
-        patient.last_name_encrypted = encrypt_field(update_data.last_name)
-        patient.date_of_birth_encrypted = encrypt_field(update_data.date_of_birth)
-        patient.gender_encrypted = encrypt_field(update_data.gender)
-        
-        # Update data hash
-        patient.data_hash = create_data_hash(
-            patient.patient_id,
-            update_data.first_name,
-            update_data.last_name,
-            update_data.date_of_birth,
-            update_data.gender
-        )
-        
-        patient.updated_at = datetime.utcnow()
-        
-        db.commit()
-        db.refresh(patient)
-        
-        return PatientDetail(
-            id=patient.id,
-            patient_id=patient.patient_id,
-            first_name=update_data.first_name,
-            last_name=update_data.last_name,
-            date_of_birth=update_data.date_of_birth,
-            gender=update_data.gender,
-            uploaded_by=current_user.username,
-            uploaded_at=patient.created_at,
-            updated_at=patient.updated_at,
-            batch_id=patient.file_upload_batch_id or "N/A"
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Update failed: {str(e)}")
-
-@router.delete("/{patient_id}")
-async def delete_patient(
-    patient_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_manager_role)
-):
-    """Delete a patient"""
-    try:
-        # Find patient
-        patient = db.query(Patient).filter(
-            and_(Patient.id == patient_id, Patient.uploaded_by == current_user.id)
-        ).first()
-        
-        if not patient:
-            raise HTTPException(status_code=404, detail="Patient not found")
-        
-        # Delete patient
-        db.delete(patient)
-        db.commit()
-        
-        return {"message": "Patient deleted successfully", "patient_id": patient_id}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Deletion failed: {str(e)}")
-
-# ===== DEBUG ENDPOINTS =====
 
 @router.post("/debug-columns")
 async def debug_file_columns(
