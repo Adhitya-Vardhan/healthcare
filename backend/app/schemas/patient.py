@@ -1,8 +1,9 @@
-# STEP 24: Create schema for upload response
+# Updated patient schemas
 # File: app/schemas/patient.py
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
+from typing import Optional, Dict, Any
 
 class PatientUploadResponse(BaseModel):
     batch_id: str
@@ -10,9 +11,6 @@ class PatientUploadResponse(BaseModel):
     total_records: int
     status: str
     uploaded_at: datetime
-
-# STEP 28: Upload status schema
-# File: app/schemas/patient.py (extend)
 
 class UploadStatus(BaseModel):
     batch_id: str
@@ -23,10 +21,7 @@ class UploadStatus(BaseModel):
     uploaded_at: datetime
 
     class Config:
-        orm_mode = True
-
-# STEP 30: Add schema to return decrypted patient data
-# File: app/schemas/patient.py
+        from_attributes = True
 
 class PatientRow(BaseModel):
     id: int
@@ -40,7 +35,7 @@ class PatientRow(BaseModel):
     updated_at: datetime
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class PatientListResponse(BaseModel):
     patients: list[PatientRow]
@@ -48,9 +43,6 @@ class PatientListResponse(BaseModel):
     limit: int
     total: int
     pages: int
-
-# STEP 32: Add schema for patient details and editing
-# File: app/schemas/patient.py
 
 class PatientDetail(BaseModel):
     id: int
@@ -65,25 +57,25 @@ class PatientDetail(BaseModel):
     batch_id: str
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class UpdatePatientRequest(BaseModel):
-    first_name: str
-    last_name: str
-    date_of_birth: str
-    gender: str
-
-# STEP 36: Add advanced search schema
-# File: app/schemas/patient.py
+    first_name: str = Field(..., min_length=1, max_length=100)
+    last_name: str = Field(..., min_length=1, max_length=100)
+    date_of_birth: str = Field(..., description="Date in YYYY-MM-DD format")
+    gender: str = Field(..., min_length=1, max_length=50)
 
 class PatientSearchRequest(BaseModel):
-    patient_id: str | None = None
-    first_name: str | None = None
-    last_name: str | None = None
-    date_of_birth: str | None = None
-    gender: str | None = None
-    date_range: dict | None = None  # {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}
+    patient_id: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    date_of_birth: Optional[str] = None
+    gender: Optional[str] = None
+    date_range: Optional[Dict[str, str]] = None  # {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}
 
-
-
-
+class CreatePatientRequest(BaseModel):
+    patient_id: str = Field(..., min_length=1, max_length=50)
+    first_name: str = Field(..., min_length=1, max_length=100)
+    last_name: str = Field(..., min_length=1, max_length=100)
+    date_of_birth: str = Field(..., description="Date in YYYY-MM-DD format")
+    gender: str = Field(..., min_length=1, max_length=50)

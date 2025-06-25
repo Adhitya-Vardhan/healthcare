@@ -1,4 +1,4 @@
-# STEP 2: Define SQLAlchemy Models based on healthcare_db_schema.sql
+# Updated models.py - Add EncryptionAuditLog model
 # File: app/models/models.py
 
 from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Text, TIMESTAMP, JSON
@@ -114,7 +114,6 @@ class UserAuditLog(Base):
 
     user = relationship("User", backref="audit_logs")
 
-
 class EncryptionKey(Base):
     __tablename__ = "encryption_keys"
 
@@ -125,3 +124,24 @@ class EncryptionKey(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
     rotated_at = Column(TIMESTAMP, nullable=True)
+
+# NEW: Encryption Audit Log Model
+class EncryptionAuditLog(Base):
+    __tablename__ = "encryption_audit_log"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    patient_id = Column(String(50), nullable=True)  # Patient ID for reference
+    operation = Column(SQLAEnum("encrypt", "decrypt", name="encryption_operation_enum"), nullable=False)
+    field_name = Column(String(100), nullable=False)  # Which field was encrypted/decrypted
+    key_version = Column(String(50), nullable=False)
+    success = Column(Boolean, nullable=False, default=True)
+    error_message = Column(Text, nullable=True)
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(Text, nullable=True)
+    timestamp = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+    # Relationships
+    user = relationship("User", backref="encryption_audit_logs")
+
+    # Indexes are handled in migration
